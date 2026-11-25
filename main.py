@@ -752,7 +752,8 @@ class LifeGuardApp:
                 win.destroy()
                 return
             left.configure(text=str(rem))
-            if rem % 5 == 0:
+            silent = bool((self.engine.wellness.pending or {}).get("silent"))   # בדיקה קולית: בלי צפצופים
+            if rem % 5 == 0 and not silent:
                 try:
                     import winsound
                     winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)

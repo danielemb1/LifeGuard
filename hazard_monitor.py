@@ -7,6 +7,8 @@ hazard_monitor.py - זיהוי סכנה ברקע מתוך מקטעי הקול ש
 - זמין רק כשהמאזין הקולי פעיל. כשהוא כבוי - אין זיהוי ברקע (status() אומר זאת במפורש).
 - אין שמירת אודיו. רק מטא-דאטה של הזיהוי עוברת ל-hazard_alerts.
 - תוצאה -> AlertManager -> on_alert(kind, alert) לממשק, או רישום בלבד (חלונות כבויים / מצב לא מתאים).
+- אירוע חדש/מוחמר בחומרה בינונית ומעלה -> גם on_checkin(category, confidence, severity): בדיקת "הכל בסדר?"
+  שקטה (wellness_check.on_audio). לא תלוי בהעדפת החלונות; ההחלטה וההגבלות - ב-WellnessMonitor.
 """
 import queue
 import threading
@@ -35,10 +37,12 @@ def load_sequence_rule():
 
 
 class HazardMonitor:
-    def __init__(self, username, can_show=lambda: True, on_alert=None, analyze=None, prefs_fn=None):
+    def __init__(self, username, can_show=lambda: True, on_alert=None, analyze=None, prefs_fn=None,
+                 on_checkin=None):
         self.username = username
         self.can_show = can_show                 # () -> (bool, סיבה) - מצב המנוע (SOS/שקט/כיבוי מדומה)
         self.on_alert = on_alert or (lambda kind, alert: None)
+        self.on_checkin = on_checkin             # (category, confidence, severity) -> "הכל בסדר?" שקט
         self.prefs_fn = prefs_fn or (lambda: HA.load_prefs(username))
         self._analyze = analyze
         self.manager = HA.AlertManager()
@@ -162,6 +166,11 @@ class HazardMonitor:
                     pass
                 if show:
                     self.on_alert(kind, alert)
+                if self.on_checkin and HA.SEVERITY_RANK.get(alert["severity"], 0) >= HA.SEVERITY_RANK["medium"]:
+                    try:
+                        self.on_checkin(alert["category"], float(alert.get("confidence") or 0.0), alert["severity"])
+                    except Exception:  # noqa: BLE001 - כשל בבדיקה לא מפיל את הזיהוי
+                        pass
             out.append((kind, alert, show, why))
         return out
 

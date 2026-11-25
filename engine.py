@@ -41,6 +41,7 @@ _SOURCE_LABELS = {
     "voice": "פקודה קולית", "safety_timer": "טיימר בטיחות שפג", "manual": "הפעלה ידנית",
     "duress": "ביטוי כפייה", "silent_voice": "ביטוי אזעקה שקטה",
     "wellness_check": "אין תשובה ל'הכל בסדר?' (נפילה / עצירה פתאומית / אין קליטה)",
+    "wellness_audio": "אין תשובה ל'הכל בסדר?' אחרי קול חשוד (ספירה עם ביטול - קול לבד אינו SOS)",
 }
 
 
@@ -128,7 +129,8 @@ class LifeGuardEngine:
         self.on_hazard_alert = lambda kind, alert: None      # main.py מחבר לחלון ההתראה
         self.hazard_monitor = hazard_monitor.HazardMonitor(
             self.username, can_show=self._hazard_can_show,
-            on_alert=lambda kind, alert: self.on_hazard_alert(kind, alert))
+            on_alert=lambda kind, alert: self.on_hazard_alert(kind, alert),
+            on_checkin=self._audio_checkin)
         self._escort_for_incident = None     # ליווי שהטיימר שלו פג - לקישור לאירוע שנפתח
 
         self._recover_interrupted_incidents()
@@ -1467,11 +1469,19 @@ class LifeGuardEngine:
             return False, "event_active"
         return True, None
 
+    def _audio_checkin(self, category, confidence, severity):
+        """זיהוי קולי בינוני ומעלה -> "הכל בסדר?" שקט (רטט). רק ב-IDLE; במעקב שקט/אירוע פעיל - לא."""
+        if self.state != State.IDLE or self.wellness is None:
+            return False
+        return self.wellness.on_audio(category, confidence, severity)
+
     def hazard_respond(self, alert, response, reason=None):
         """רישום תגובת המשתמש/ת וסגירת האירוע (שקט לפי סוג התגובה). לא מבצע את הפעולה עצמה."""
         import hazard_alerts
         hazard_alerts.record_response(self.username, alert, response, reason)
         self.hazard_monitor.manager.close(alert, response)
+        if self.wellness is not None and response != "sos":
+            self.wellness.dismiss_audio()      # תגובה לחלון = המשתמש/ת ערני/ת; "sos" ממשיך במסלול שלו
 
     def hazard_activate_sos(self, alert):
         """אחרי אישור מפורש בלבד (החלון שואל). אותו מסלול כמו לחיצה על הכפתור: הערכת סיכון + ספירה לאחור."""

@@ -5,6 +5,11 @@ wellness_check.py - "הכל בסדר?": המערכת שואלת אחרי איר�
 טריגרים:
 - נפילה / מכה חזקה (חיישן תאוצה בטלפון/שעון - sensor_module, דרך engine.report_sensor_signal)
 - עצירה פתאומית: תנועה מהירה (ריצה/רכב) ואז עמידה במקום - לפי רצף מיקומים (detect_abrupt_stop)
+- קול חשוד (hazard_monitor -> engine -> on_audio): אירוע קולי בחומרה בינונית ומעלה (שבירה / אזעקה / צרחה /
+  ירי / פיצוץ) או קול מצוקה. בדיקה *שקטה* (רטט, בלי צפצופים) - הקול לבד לא מספיק לקריאת חירום
+  (research/hazard_v3_freesound.md: צרחת פחד וצרחת שמחה לא נפרדות). אין תשובה -> engine.trigger *בלי* force_panic:
+  ספירה לאחור עם ביטול + הערכת הסיכון הרגילה (risk_module) - לא SOS מיידי. "מידע"/"נמוכה" (סירנה, זיקוקים,
+  חבטה) לא שואלים בכלל. הגבלת קצב: שאלה קולית אחת לכל AUDIO_MIN_INTERVAL_SECONDS.
 - אין קליטה: הטלפון בלי חיבור יותר מ-SIGNAL_LOSS_SECONDS בזמן ליווי/טיימר בטיחות פעיל.
   במצב כזה השרת לא יכול לשאול - לכן השאלה והתגובה קורות *במכשיר עצמו* (סירנה מקומית, SOS שנשמר
   ויישלח כשהקליטה תחזור; בטלפון - גם SMS ישיר לאנשי הקשר).
@@ -28,6 +33,22 @@ STILL_MPS = 0.5
 STILL_SECONDS = 20
 REASONS_HE = {"fall": "זוהתה נפילה", "impact": "זוהתה מכה חזקה", "abrupt_stop": "עצירה פתאומית",
               "signal_loss": "אין קליטה כבר כמה דקות"}
+# קול: רק חומרה בינונית ומעלה (audio_intel severity_prior). info/low - לעולם לא שואלים.
+AUDIO_SEVERITIES = ("medium", "high")
+AUDIO_MIN_INTERVAL_SECONDS = 2 * 60     # שאלה קולית אחת לכל 2 דק' - חלונות חוזרים של אותו צליל לא מציפים
+AUDIO_PREFIX = "audio:"
+AUDIO_REASONS_HE = {"distress_voice": "נשמע קול מצוקה", "scream": "נשמעה צרחה", "glass_break": "נשמעה שבירת זכוכית",
+                    "alarm": "נשמעה אזעקה", "gunshot": "נשמע צליל שדומה לירי", "explosion": "נשמע צליל שדומה לפיצוץ"}
+
+
+def reason_text(reason):
+    if reason.startswith(AUDIO_PREFIX):
+        return AUDIO_REASONS_HE.get(reason[len(AUDIO_PREFIX):], "נשמע צליל חשוד")
+    return REASONS_HE.get(reason, reason)
+
+
+def is_audio_reason(reason):
+    return bool(reason) and reason.startswith(AUDIO_PREFIX)
 
 
 def _speed(a, b):
@@ -64,6 +85,7 @@ class WellnessMonitor:
         self.quiet_until = 0.0
         self.fixes = []
         self.offline_since = None
+        self.audio_last = None         # זמן השאלה הקולית האחרונה (הגבלת קצב)
         self._lock = threading.RLock()
         self._timer = None
 
@@ -72,6 +94,29 @@ class WellnessMonitor:
         thr = SENSOR_TRIGGERS.get(signal)
         if thr is not None and confidence >= thr:
             self.start_checkin(signal)
+
+    def on_audio(self, category, confidence=0.0, severity="medium"):
+        """זיהוי קולי (hazard_monitor). רק medium/high -> בדיקה שקטה. מחזיר True אם נפתחה שאלה."""
+        if severity not in AUDIO_SEVERITIES:
+            return False
+        now = self.clock()
+        with self._lock:
+            if self.audio_last is not None and now - self.audio_last < AUDIO_MIN_INTERVAL_SECONDS:
+                return False
+        started = self.start_checkin(AUDIO_PREFIX + str(category), silent=True,
+                                     meta={"confidence": float(confidence or 0.0), "severity": severity})
+        if started:
+            with self._lock:
+                self.audio_last = now
+        return started
+
+    def dismiss_audio(self):
+        """המשתמש/ת הגיב/ה לחלון הסכנה הקולי (כל תגובה מוכיחה שהוא/היא ערני/ת) - סוגר שאלה קולית פתוחה."""
+        with self._lock:
+            audio = bool(self.pending) and is_audio_reason(self.pending["reason"])
+        if audio:
+            self.answer(True)
+        return audio
 
     def on_location(self, t, lat, lon):
         with self._lock:
@@ -103,15 +148,19 @@ class WellnessMonitor:
         st = getattr(getattr(self.engine, "state", None), "name", "IDLE")
         return st not in ("IDLE", "FEEDBACK")
 
-    def start_checkin(self, reason):
+    def start_checkin(self, reason, silent=False, meta=None):
+        """silent=True: רטט בלבד (בלי צפצופים) - הממשק קורא pending["silent"]."""
         now = self.clock()
         with self._lock:
             if self.pending or now < self.quiet_until or self._engine_busy():
                 return False
-            self.pending = {"reason": reason, "deadline": now + self.checkin_seconds}
-        self._log(f"❓ {REASONS_HE.get(reason, reason)} - שואל 'הכל בסדר?' ({self.checkin_seconds} שנ')")
+            self.pending = {"reason": reason, "deadline": now + self.checkin_seconds, "silent": bool(silent),
+                            "meta": dict(meta or {})}
+            deadline = self.pending["deadline"]
+        self._log(f"❓ {reason_text(reason)} - שואל 'הכל בסדר?' ({self.checkin_seconds} שנ')"
+                  + (" - בדיקה שקטה" if silent else ""))
         if self.ask:
-            self.ask(REASONS_HE.get(reason, reason), self.pending["deadline"], self.answer)
+            self.ask(reason_text(reason), deadline, self.answer)
         self._timer = threading.Timer(self.checkin_seconds, self._expire)
         self._timer.daemon = True
         self._timer.start()
@@ -138,11 +187,18 @@ class WellnessMonitor:
                 return
             reason = self.pending["reason"]
             self.pending = None
-        self._escalate(reason, "לא הייתה תשובה ל'הכל בסדר?'")
+        self._escalate(reason, "לא הייתה תשובה ל'הכל בסדר?'", confirmed=False)
 
-    def _escalate(self, reason, why):
-        self._log(f"🚨 {why} ({REASONS_HE.get(reason, reason)}) - מפעיל SOS")
+    def _escalate(self, reason, why, confirmed=True):
+        """confirmed: המשתמש/ת ביקש/ה עזרה במפורש -> SOS מיידי. קול + אין תשובה -> המסלול הרגיל
+        (ספירה לאחור עם ביטול + הערכת סיכון), כי קול לבדו לעולם לא מפעיל SOS אוטומטי."""
         trig = getattr(self.engine, "trigger", None)
+        if is_audio_reason(reason) and not confirmed:
+            self._log(f"⚠️ {why} ({reason_text(reason)}) - פותח ספירה לאחור עם אפשרות ביטול")
+            if trig:
+                trig(force_panic=False, source="wellness_audio")
+            return
+        self._log(f"🚨 {why} ({reason_text(reason)}) - מפעיל SOS")
         if trig:
             trig(force_panic=True, source="wellness_check")
 
